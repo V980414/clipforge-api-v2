@@ -1,4 +1,5 @@
 """Pipeline: download YouTube → transcribe → analyze with Lovable AI → cut with FFmpeg."""
+
 import os
 import json
 import shutil
@@ -7,7 +8,6 @@ import logging
 import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict
-from dataclasses import dataclass
 
 import httpx
 import yt_dlp
@@ -23,9 +23,9 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 LOVABLE_API_KEY = os.environ.get("LOVABLE_API_KEY", "")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # ex: https://clipforge-api.up.railway.app
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
+YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES_FILE", "")  # opcional: caminho pro cookies.txt
 
-# Modelo carregado lazy (1ª req demora ~30s)
 _whisper: Optional[WhisperModel] = None
 
 
@@ -73,24 +73,152 @@ def _update(job_id: str, **kwargs):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Download
+# 1) Download — robusto com cascata de fallbacks
 # ──────────────────────────────────────────────────────────────────────────────
+# Cascata (separada por "/"): yt-dlp tenta da esquerda pra direita até funcionar.
+# 1. MP4 H.264 + M4A AAC até 1080p (ideal pro FFmpeg/Whisper, sem reencode pesado)
+# 2. Qualquer vídeo + qualquer áudio até 1080p (yt-dlp faz merge)
+# 3. Melhor MP4 progressivo (vídeo+áudio num arquivo só) até 720p
+# 4. "best" — último recurso, qualquer container
+_FORMAT_CASCADE = (
+    "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]"
+    "/bv*[height<=1080]+ba"
+    "/b[ext=mp4][height<=720]"
+    "/best"
+)
+
+_COMMON_YDL_OPTS = {
+    "merge_output_format": "mp4",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "retries": 5,
+    "fragment_retries": 5,
+    "extractor_retries": 3,
+    "socket_timeout": 30,
+    "concurrent_fragment_downloads": 4,
+    "nocheckcertificate": True,
+    "geo_bypass": True,
+    # Headers pra evitar 403/formato indisponível em alguns vídeos
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
+    },
+    # Força cliente Android/web — costuma expor mais formatos que o default
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web", "ios"],
+        }
+    },
+}
+
+
+def _ydl_opts(out_dir: Path, fmt: str) -> dict:
+    opts = dict(_COMMON_YDL_OPTS)
+    opts["format"] = fmt
+    opts["outtmpl"] = str(out_dir / "source.%(ext)s")
+    if YTDLP_COOKIES and Path(YTDLP_COOKIES).exists():
+        opts["cookiefile"] = YTDLP_COOKIES
+    return opts
+
+
+def _find_downloaded(out_dir: Path) -> Optional[Path]:
+    for ext in ("mp4", "mkv", "webm", "m4a", "mov"):
+        p = out_dir / f"source.{ext}"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+def _remux_to_mp4(src: Path, dst: Path) -> None:
+    """Remux (sem reencode) pra MP4 quando o download veio em mkv/webm."""
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-c", "copy", "-movflags", "+faststart",
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        # se copy falhar (codec incompatível com mp4), reencode rápido
+        log.warning("remux copy failed, reencoding: %s", proc.stderr[-300:])
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"remux failed: {proc.stderr[-300:]}")
+
+
 def download_youtube(youtube_url: str, out_dir: Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
-    opts = {
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "merge_output_format": "mp4",
-        "outtmpl": str(out_dir / "source.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
+
+    last_err: Optional[Exception] = None
+    info = None
+
+    # Tenta a cascata completa primeiro; se falhar inteiro, tenta cada nível isolado
+    attempts = [_FORMAT_CASCADE] + _FORMAT_CASCADE.split("/")
+
+    for fmt in attempts:
+        # limpa restos da tentativa anterior
+        for f in out_dir.glob("source.*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+        try:
+            log.info("yt-dlp attempt with format=%s", fmt)
+            with yt_dlp.YoutubeDL(_ydl_opts(out_dir, fmt)) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+            chosen_id = info.get("format_id")
+            chosen_ext = info.get("ext")
+            log.info(
+                "yt-dlp OK: format_id=%s ext=%s height=%s",
+                chosen_id, chosen_ext, info.get("height"),
+            )
+            break
+        except yt_dlp.utils.DownloadError as e:
+            last_err = e
+            log.warning("yt-dlp failed with format=%s: %s", fmt, str(e)[:300])
+            continue
+        except Exception as e:
+            last_err = e
+            log.warning("yt-dlp unexpected error with format=%s: %s", fmt, str(e)[:300])
+            continue
+
+    if info is None:
+        raise RuntimeError(
+            f"Não foi possível baixar o vídeo após múltiplas tentativas. "
+            f"Último erro: {last_err}"
+        )
+
+    downloaded = _find_downloaded(out_dir)
+    if downloaded is None:
+        raise RuntimeError("Download terminou mas o arquivo não foi encontrado.")
+
+    target = out_dir / "source.mp4"
+    if downloaded.suffix.lower() != ".mp4":
+        log.info("Remuxing %s → source.mp4", downloaded.name)
+        _remux_to_mp4(downloaded, target)
+        try:
+            downloaded.unlink()
+        except Exception:
+            pass
+    elif downloaded != target:
+        downloaded.rename(target)
+
     return {
-        "path": str(out_dir / "source.mp4"),
+        "path": str(target),
         "title": info.get("title", "Untitled"),
-        "duration": float(info.get("duration", 0)),
+        "duration": float(info.get("duration", 0) or 0),
         "youtube_id": info.get("id"),
     }
 
@@ -122,7 +250,6 @@ async def select_clips_with_ai(
     if not LOVABLE_API_KEY:
         raise RuntimeError("LOVABLE_API_KEY not configured")
 
-    # Prepara índice "tempo: texto" pra a IA referenciar
     indexed = "\n".join(f"[{int(s['start'])}-{int(s['end'])}] {s['text']}" for s in segments)
     if len(indexed) > 80_000:
         indexed = indexed[:80_000]
@@ -181,7 +308,6 @@ Retorne JSON puro neste formato:
 # 4) Cut + 9:16 + subtitles (FFmpeg)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_srt(segments: list, start: float, end: float) -> str:
-    """Gera SRT relativo (0-based) cobrindo apenas o intervalo do corte."""
     def fmt(t):
         h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
         return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
@@ -207,16 +333,10 @@ def cut_clip(
     out_path: Path,
     work_dir: Path,
 ) -> None:
-    """Corta, redimensiona pra 1080x1920 (9:16) com blur de fundo, queima legenda."""
     srt_path = work_dir / f"{out_path.stem}.srt"
     srt_path.write_text(build_srt(segments, start, end), encoding="utf-8")
-
     duration = end - start
 
-    # Filter complex:
-    # 1) Background: scale to fill 1080x1920 + blur (vídeo borrado atrás)
-    # 2) Foreground: scale to fit width 1080 mantendo aspect, centralizado
-    # 3) Overlay + subtítulos
     vf = (
         "[0:v]split=2[bg][fg];"
         "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -259,7 +379,6 @@ async def process_video(
 ):
     work = WORK_DIR / job_id
     try:
-        # 1) Download
         _update(job_id, status="downloading", progress=5)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, download_youtube, youtube_url, work)
@@ -271,17 +390,14 @@ async def process_video(
             progress=25,
         )
 
-        # 2) Transcribe
         tr = await loop.run_in_executor(None, transcribe, info["path"])
         _update(job_id, status="analyzing", progress=55)
 
-        # 3) AI select
         ai_clips = await select_clips_with_ai(
             info["title"], tr["full_text"], tr["segments"], max_clips, target_duration
         )
         _update(job_id, status="cutting", progress=70)
 
-        # 4) Cut + render
         out_clips: List[ClipOut] = []
         total = max(len(ai_clips), 1)
         for i, c in enumerate(ai_clips):
@@ -293,7 +409,6 @@ async def process_video(
 
             out_name = f"{job_id}_{i}.mp4"
             out_path = CLIPS_DIR / out_name
-
             try:
                 await loop.run_in_executor(
                     None, cut_clip, info["path"], start, end, tr["segments"], out_path, work
@@ -321,7 +436,6 @@ async def process_video(
         _update(job_id, status="completed", progress=100, clips=out_clips)
         log.info("Job %s completed with %d clips", job_id, len(out_clips))
 
-        # Webhook
         if callback_url:
             try:
                 state = JOBS[job_id]
@@ -348,7 +462,6 @@ async def process_video(
             except Exception:
                 pass
     finally:
-        # limpa arquivo grande do download
         try:
             shutil.rmtree(work, ignore_errors=True)
         except Exception:
